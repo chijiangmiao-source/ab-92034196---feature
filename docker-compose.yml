@@ -1,0 +1,55 @@
+services:
+  # Persistent high-risk telecommand duty service (select-before-execute).
+  duty:
+    build: .
+    image: gs-duty:latest
+    environment:
+      DATA_DIR: /data
+      GATEWAY_LOG: /data/gateway.log
+      HOST: "0.0.0.0"
+      PORT: "8080"
+    volumes:
+      - duty-data:/data
+    healthcheck:
+      # python is guaranteed present (slim image; curl is not)
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3); sys.exit(0 if r.status==200 else 1)"
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+  # One-shot acceptance service.
+  #
+  # Runs (and exits, reporting via its exit code):
+  #   1. unittest code tests
+  #   2. byte-compile build check
+  #   3. in-container HTTP/API smoke covering:
+  #        - health + select/execute/replay/conflict protocol
+  #        - concurrent execution requests racing one valid choice
+  #        - expired choice rejection
+  #        - power cut BEFORE the result record, restart, safe retry
+  #        - power cut AFTER the result record, restart, replay
+  #        - corrupt durable record -> health reports abnormal
+  #   4. the same health + select/execute smoke against the running
+  #      `duty` service over the compose network (BASE_URL)
+  #
+  # The two crash/restart scenarios spawn throwaway server subprocesses
+  # inside this container (fresh temp DATA_DIRs) so the injected hard
+  # kills never disturb the long-lived `duty` service.
+  verify:
+    build: .
+    image: gs-duty:latest
+    command: ["python", "scripts/acceptance.py"]
+    environment:
+      BASE_URL: "http://duty:8080"
+    depends_on:
+      duty:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  duty-data:
