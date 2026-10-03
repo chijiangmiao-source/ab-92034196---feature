@@ -31,11 +31,15 @@ services:
   #        - health + select/execute/replay/conflict protocol
   #        - concurrent execution requests racing one valid choice
   #        - expired choice rejection
+  #        - withdrawal: commit, identical-retx replay, field conflicts,
+  #          execute rejected after withdrawal, re-select under a new op id
+  #        - withdrawal vs execution race -> single terminal outcome
+  #        - withdrawal terminal state replayed after a restart
   #        - power cut BEFORE the result record, restart, safe retry
   #        - power cut AFTER the result record, restart, replay
   #        - corrupt durable record -> health reports abnormal
-  #   4. the same health + select/execute smoke against the running
-  #      `duty` service over the compose network (BASE_URL)
+  #   4. the same health + select/execute/withdraw smoke against the
+  #      running `duty` service over the compose network (BASE_URL)
   #
   # The two crash/restart scenarios spawn throwaway server subprocesses
   # inside this container (fresh temp DATA_DIRs) so the injected hard

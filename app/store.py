@@ -11,6 +11,9 @@ Recovery rules (crash may happen at *any* point, incl. mid-fsync):
 * ``executing`` record intact, no result        -> ``SELECTED`` (safe retry)
 * An intact ``executing`` *and* an intact
   ``result`` record                              -> ``EXECUTED`` (replayable)
+* An intact ``withdrawn`` record (no result)    -> ``WITHDRAWN`` (terminal;
+                                                   the choice can never be
+                                                   executed or re-selected)
 * A corrupt / unverifiable record               -> health UNHEALTHY;
                                                    the device's choice is
                                                    quarantined and refuses
@@ -18,6 +21,11 @@ Recovery rules (crash may happen at *any* point, incl. mid-fsync):
 
 Old choices never revive: replacing a choice writes a new index entry that
 points at a new operation file; stale files are simply not referenced.
+Withdrawn choices stay terminally withdrawn across restarts: the
+``withdrawn`` record is fsynced before the verdict is returned, and the
+per-operation log remains readable (``load_op``) so a retransmitted
+withdrawal still replays the original verdict even after the device has
+moved on to a new choice.
 """
 
 from __future__ import annotations
@@ -33,10 +41,12 @@ from typing import Optional
 RECORD_SELECTED = "selected"
 RECORD_EXECUTING = "executing"
 RECORD_RESULT = "result"
+RECORD_WITHDRAWN = "withdrawn"
 
 STATE_MISSING = "MISSING"
 STATE_SELECTED = "SELECTED"
 STATE_EXECUTED = "EXECUTED"
+STATE_WITHDRAWN = "WITHDRAWN"
 
 MAGIC = "GS-CHOICE-1"
 
@@ -81,6 +91,7 @@ class _IndexEntry:
     state: str = STATE_MISSING
     record: Optional[dict] = None
     result: Optional[dict] = None
+    withdrawal: Optional[dict] = None
     corrupt: bool = False
 
 
@@ -176,16 +187,21 @@ class RecordStore:
         latest_selected = None
         executing = False
         result = None
+        withdrawn = None
         for rec in records:
             kind = rec.get("kind")
             if kind == RECORD_SELECTED and rec.get("op_id") == op_id:
                 latest_selected = rec
                 executing = False
                 result = None
+                withdrawn = None
             elif kind == RECORD_EXECUTING and rec.get("op_id") == op_id:
                 executing = True
             elif kind == RECORD_RESULT and rec.get("op_id") == op_id:
                 result = rec
+                executing = False
+            elif kind == RECORD_WITHDRAWN and rec.get("op_id") == op_id:
+                withdrawn = rec
                 executing = False
 
         if latest_selected is None:
@@ -197,6 +213,12 @@ class RecordStore:
         if result is not None:
             entry.state = STATE_EXECUTED
             entry.result = result
+        elif withdrawn is not None:
+            # Withdrawal is terminal: the choice must never become
+            # executable again, even if an "executing" marker from a
+            # crash-interrupted attempt precedes it in the log.
+            entry.state = STATE_WITHDRAWN
+            entry.withdrawal = withdrawn
         elif executing:
             # Crash between "executing" and "result" fsync: the downstream
             # command may or may not have happened.  We cannot prove
@@ -301,6 +323,34 @@ class RecordStore:
             self.append(entry.op_id, result)
             entry.state = STATE_EXECUTED
             entry.result = result
+
+    def put_withdrawal(self, device_id: str, record: dict) -> None:
+        """Persist a withdrawal verdict; terminal for the current choice.
+
+        The record is appended + fsynced before the in-memory state flips,
+        so a committed withdrawal always survives a power cut.  The device
+        index keeps pointing at the same operation file: recovery restores
+        ``WITHDRAWN`` until a *new* choice (new operation id) replaces it.
+        """
+        with self._lock:
+            entry = self._devices.get(device_id)
+            if entry is None or entry.record is None:
+                return
+            self.append(entry.op_id, record)
+            entry.state = STATE_WITHDRAWN
+            entry.withdrawal = record
+
+    def load_op(self, op_id: str) -> Optional[_IndexEntry]:
+        """Load the durable record chain for an operation id, if any.
+
+        Used to answer retransmitted withdrawals for an operation that is
+        no longer the device's *current* choice (the device may have moved
+        on after the withdrawal).  Returns None when no log exists.
+        """
+        fname = os.path.basename(_record_path(self.data_dir, op_id))
+        if not os.path.exists(os.path.join(self.data_dir, fname)):
+            return None
+        return self._load_file(fname, op_id)
 
     def get(self, device_id: str) -> Optional[_IndexEntry]:
         with self._lock:

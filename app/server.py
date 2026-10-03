@@ -4,6 +4,7 @@ Endpoints
 ---------
 POST /v1/choices        create / retransmit a choice
 POST /v1/executions     consume a choice and execute
+POST /v1/withdrawals    withdraw a still-unexecuted choice (terminal)
 GET  /v1/devices/<id>   inspect recovered device state
 GET  /healthz           liveness + durable-record integrity
 
@@ -96,6 +97,14 @@ class Handler(BaseHTTPRequestHandler):
                 op_id=data.get("op_id", ""),
                 summary=data.get("summary", ""),
                 _crash=data.get("crash"),
+            )
+            self._send(resp)
+            return
+        if path == "/v1/withdrawals":
+            resp = self.service.withdraw(
+                device_id=data.get("device_id", ""),
+                op_id=data.get("op_id", ""),
+                summary=data.get("summary", ""),
             )
             self._send(resp)
             return

@@ -1,4 +1,4 @@
-"""Unit tests for select/execute adjudication, concurrency and recovery."""
+"""Unit tests for select/execute/withdraw adjudication, concurrency and recovery."""
 
 from __future__ import annotations
 
@@ -20,18 +20,26 @@ from app.service import (
     V_CHOICE_DEVICE_EXECUTED,
     V_CHOICE_EXPIRED_REQUEST,
     V_CHOICE_REPLAYED,
+    V_CHOICE_WITHDRAWN,
     V_EXEC_ACCEPTED,
     V_EXEC_EXPIRED,
     V_EXEC_NO_CHOICE,
     V_EXEC_QUARANTINED,
     V_EXEC_REPLAYED,
     V_EXEC_SUMMARY_MISMATCH,
+    V_EXEC_WITHDRAWN,
     V_EXEC_WRONG_OP,
+    V_WITHDRAW_CONFLICT,
+    V_WITHDRAW_EXECUTED,
+    V_WITHDRAW_NO_CHOICE,
+    V_WITHDRAW_REPLAYED,
+    V_WITHDRAWN,
 )
 from app.store import (
     RecordStore,
     STATE_EXECUTED,
     STATE_SELECTED,
+    STATE_WITHDRAWN,
     RECORD_EXECUTING,
 )
 
@@ -47,7 +55,9 @@ class FakeClock:
         self.t += dt
 
 
-class ServiceCase(unittest.TestCase):
+class ServiceFixture(unittest.TestCase):
+    """Shared fixture: fresh store/gateway/service with a fake clock."""
+
     def setUp(self):
         self.dir = tempfile.mkdtemp()
         self.clock = FakeClock()
@@ -60,6 +70,15 @@ class ServiceCase(unittest.TestCase):
 
     def select(self, device="DEV-1", op="OP-1", summary="CMD:arm", ttl=100):
         return self.svc.select(device, op, summary, self.clock.t + ttl)
+
+    def _fresh_service(self):
+        """Simulate a process restart over the same durable directory."""
+        store = RecordStore(self.dir)
+        gw = DeviceGateway(os.path.join(self.dir, "gateway.log"))
+        return DutyService(store, gw, clock=self.clock), store, gw
+
+
+class ServiceCase(ServiceFixture):
 
     # ------------------------------------------------------------------ #
     # basic protocol
@@ -208,11 +227,6 @@ class ServiceCase(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # crash recovery
     # ------------------------------------------------------------------ #
-    def _fresh_service(self):
-        store = RecordStore(self.dir)
-        gw = DeviceGateway(os.path.join(self.dir, "gateway.log"))
-        return DutyService(store, gw, clock=self.clock), store, gw
-
     def test_recover_after_crash_before_result_durable(self):
         self.select()
         # Downstream dispatch happened, executing marker durable, then
@@ -290,6 +304,229 @@ class ServiceCase(unittest.TestCase):
     def test_healthy_initially(self):
         self.select()
         self.assertEqual(RecordStore(self.dir).health().status, "ok")
+
+
+class WithdrawalCase(ServiceFixture):
+    """Withdrawal adjudication: terminal verdicts, replay, races, reboot."""
+
+    # ------------------------------------------------------------------ #
+    # basic withdrawal protocol
+    # ------------------------------------------------------------------ #
+    def test_withdraw_happy_path_and_retx(self):
+        self.select()
+        w = self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w.verdict, V_WITHDRAWN)
+        self.assertEqual(w.http_status, 200)
+        self.assertEqual(w.result["state"], STATE_WITHDRAWN)
+        withdrawn_at = w.result["withdrawn_at"]
+
+        # identical withdrawal retransmission replays the original verdict
+        w2 = self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w2.verdict, V_WITHDRAW_REPLAYED)
+        self.assertEqual(w2.result["withdrawn_at"], withdrawn_at)
+
+        # the withdrawn choice must never execute
+        e = self.svc.execute("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(e.verdict, V_EXEC_WITHDRAWN)
+        self.assertEqual(e.http_status, 410)
+        self.assertEqual(self.gw.dispatch_count, 0)
+
+        # the withdrawn op id can never be re-selected
+        r = self.select()
+        self.assertEqual(r.verdict, V_CHOICE_WITHDRAWN)
+        self.assertEqual(r.http_status, 409)
+
+        # device_state exposes the terminal withdrawal
+        st = self.svc.device_state("DEV-1")
+        self.assertEqual(st.result["state"], STATE_WITHDRAWN)
+        self.assertEqual(st.result["withdrawal"]["withdrawn_at"], withdrawn_at)
+
+    def test_reselect_new_op_after_withdrawal(self):
+        self.select()
+        self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+
+        # a new operation id follows the normal select-execute flow
+        r = self.svc.select("DEV-1", "OP-2", "CMD:arm", self.clock.t + 100)
+        self.assertEqual(r.verdict, V_CHOICE_CREATED)
+        e = self.svc.execute("DEV-1", "OP-2", "CMD:arm")
+        self.assertEqual(e.verdict, V_EXEC_ACCEPTED)
+        self.assertEqual(self.gw.dispatch_count, 1)
+
+        # the old withdrawal still replays from durable history even
+        # though the device has moved on (and been executed)
+        w = self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w.verdict, V_WITHDRAW_REPLAYED)
+        self.assertEqual(w.result["op_id"], "OP-1")
+
+    def test_withdraw_conflicts_and_no_choice(self):
+        # no choice at all for the device
+        w = self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w.verdict, V_WITHDRAW_NO_CHOICE)
+        self.assertEqual(w.http_status, 404)
+
+        self.select()
+        # summary mismatch -> explicit conflict
+        w2 = self.svc.withdraw("DEV-1", "OP-1", "CMD:disarm")
+        self.assertEqual(w2.verdict, V_WITHDRAW_CONFLICT)
+        self.assertEqual(w2.http_status, 409)
+        # the live choice belongs to another operation id -> conflict
+        w3 = self.svc.withdraw("DEV-1", "OP-2", "CMD:arm")
+        self.assertEqual(w3.verdict, V_WITHDRAW_CONFLICT)
+        self.assertEqual(w3.http_status, 409)
+
+        # conflicts did not disturb the original choice
+        e = self.svc.execute("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(e.verdict, V_EXEC_ACCEPTED)
+
+    def test_withdraw_after_execute_returns_executed_result(self):
+        self.select()
+        e = self.svc.execute("DEV-1", "OP-1", "CMD:arm")
+        receipt = e.result["outcome"]["receipt"]
+
+        w = self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w.verdict, V_WITHDRAW_EXECUTED)
+        self.assertEqual(w.http_status, 409)
+        self.assertEqual(w.result["state"], STATE_EXECUTED)
+        self.assertEqual(w.result["outcome"]["receipt"], receipt)
+
+        # existing executed-device semantics are unchanged
+        e2 = self.svc.execute("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(e2.verdict, V_EXEC_REPLAYED)
+        r = self.svc.select("DEV-1", "OP-9", "CMD:arm", self.clock.t + 100)
+        self.assertEqual(r.verdict, V_CHOICE_DEVICE_EXECUTED)
+
+    def test_withdraw_superseded_choice_conflicts(self):
+        # OP-1 expires and is replaced by OP-2 without ever being
+        # executed or withdrawn: it no longer belongs to OP-1.
+        self.select(ttl=10)
+        self.clock.advance(11)
+        self.svc.select("DEV-1", "OP-2", "CMD:arm", self.clock.t + 100)
+
+        w = self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w.verdict, V_WITHDRAW_CONFLICT)
+        self.assertEqual(w.http_status, 409)
+
+    def test_withdraw_expired_unexecuted_choice_commits(self):
+        # An expired choice can never execute; withdrawing it is still a
+        # valid terminal decision (nothing was dispatched).
+        self.select(ttl=10)
+        self.clock.advance(11)
+        w = self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w.verdict, V_WITHDRAWN)
+        e = self.svc.execute("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(e.verdict, V_EXEC_WITHDRAWN)
+
+    # ------------------------------------------------------------------ #
+    # concurrency: withdrawal vs execution -> single terminal state
+    # ------------------------------------------------------------------ #
+    def test_withdraw_execute_race_single_terminal_state(self):
+        for trial in range(4):
+            device, op = f"DEV-R{trial}", f"OP-R{trial}"
+            r = self.svc.select(device, op, "CMD:arm", self.clock.t + 100)
+            self.assertEqual(r.verdict, V_CHOICE_CREATED)
+            dispatched_before = self.gw.dispatch_count
+
+            results = []
+            barrier = threading.Barrier(6)
+
+            def do_withdraw():
+                barrier.wait()
+                results.append(self.svc.withdraw(device, op, "CMD:arm"))
+
+            def do_execute():
+                barrier.wait()
+                results.append(self.svc.execute(device, op, "CMD:arm"))
+
+            threads = ([threading.Thread(target=do_withdraw)
+                        for _ in range(3)]
+                       + [threading.Thread(target=do_execute)
+                          for _ in range(3)])
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            withdraws = [x for x in results
+                         if x.verdict in (V_WITHDRAWN, V_WITHDRAW_REPLAYED,
+                                          V_WITHDRAW_EXECUTED)]
+            executes = [x for x in results
+                        if x.verdict in (V_EXEC_ACCEPTED, V_EXEC_REPLAYED,
+                                         V_EXEC_WITHDRAWN)]
+            # every request reached a terminal verdict (never "processing")
+            self.assertEqual(len(results), 6)
+            self.assertEqual(len(withdraws), 3)
+            self.assertEqual(len(executes), 3)
+
+            dispatched = self.gw.dispatch_count - dispatched_before
+            if dispatched:
+                # execution committed first: exactly one first consumer,
+                # withdrawals observe the executed result
+                self.assertEqual(dispatched, 1)
+                self.assertEqual(
+                    [x.verdict for x in executes].count(V_EXEC_ACCEPTED), 1)
+                self.assertTrue(all(
+                    x.verdict == V_WITHDRAW_EXECUTED for x in withdraws))
+                receipts = {x.result["outcome"]["receipt"]
+                            for x in results}
+                self.assertEqual(len(receipts), 1)
+            else:
+                # withdrawal committed first: payload never dispatched
+                self.assertEqual(
+                    [x.verdict for x in withdraws].count(V_WITHDRAWN), 1)
+                self.assertEqual(
+                    [x.verdict for x in withdraws].count(V_WITHDRAW_REPLAYED),
+                    2)
+                self.assertTrue(all(
+                    x.verdict == V_EXEC_WITHDRAWN for x in executes))
+
+    # ------------------------------------------------------------------ #
+    # restart: withdrawn is a durable terminal state
+    # ------------------------------------------------------------------ #
+    def test_withdrawal_survives_restart(self):
+        self.select()
+        w = self.svc.withdraw("DEV-1", "OP-1", "CMD:arm")
+        withdrawn_at = w.result["withdrawn_at"]
+
+        svc2, store2, gw2 = self._fresh_service()
+        entry = store2.get("DEV-1")
+        self.assertEqual(entry.state, STATE_WITHDRAWN)
+
+        # terminal verdict replays identically after the reboot
+        w2 = svc2.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w2.verdict, V_WITHDRAW_REPLAYED)
+        self.assertEqual(w2.result["withdrawn_at"], withdrawn_at)
+
+        # the withdrawn choice did not become executable again
+        e = svc2.execute("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(e.verdict, V_EXEC_WITHDRAWN)
+        self.assertEqual(gw2.dispatch_count, 0)
+        r = svc2.select("DEV-1", "OP-1", "CMD:arm", self.clock.t + 100)
+        self.assertEqual(r.verdict, V_CHOICE_WITHDRAWN)
+
+        # a new operation id works after the reboot
+        r2 = svc2.select("DEV-1", "OP-2", "CMD:arm", self.clock.t + 100)
+        self.assertEqual(r2.verdict, V_CHOICE_CREATED)
+        e2 = svc2.execute("DEV-1", "OP-2", "CMD:arm")
+        self.assertEqual(e2.verdict, V_EXEC_ACCEPTED)
+
+        # ... and the old withdrawal still replays after yet another
+        # restart, even though the device has moved on to OP-2
+        svc3, store3, gw3 = self._fresh_service()
+        self.assertEqual(store3.get("DEV-1").op_id, "OP-2")
+        w3 = svc3.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w3.verdict, V_WITHDRAW_REPLAYED)
+        self.assertEqual(w3.result["withdrawn_at"], withdrawn_at)
+
+    def test_withdraw_on_corrupt_device_quarantined(self):
+        self.select()
+        path = glob.glob(os.path.join(self.dir, "op-*.log"))[0]
+        with open(path, "ab") as fh:
+            fh.write(b"GS-CHOICE-1|deadbeef|{\"kind\":\"withdrawn\"}\n")
+        store2 = RecordStore(self.dir)
+        svc2 = DutyService(store2, self.gw, clock=self.clock)
+        w = svc2.withdraw("DEV-1", "OP-1", "CMD:arm")
+        self.assertEqual(w.verdict, V_EXEC_QUARANTINED)
+        self.assertEqual(w.http_status, 503)
 
 
 if __name__ == "__main__":
