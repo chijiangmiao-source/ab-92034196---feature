@@ -12,6 +12,10 @@ Phases (exits non-zero on any failure):
                             * N concurrent execution requests racing one
                               valid choice (exactly one first consumer)
                             * expired choice rejection
+                            * withdrawal: immutable verdict + retx replay,
+                              field conflicts, re-select under a new op id,
+                              withdraw/execute race (single terminal state)
+                            * withdrawal final state replayed after restart
                             * power cut BEFORE the result is durable,
                               restart, safe retry (single physical dispatch)
                             * power cut AFTER the result is durable,
@@ -327,6 +331,210 @@ def smoke_expiry(data_dir: str) -> None:
         srv.stop()
 
 
+def smoke_withdrawal(data_dir: str) -> None:
+    section("PHASE 3g: withdrawal (retx replay, conflicts, re-select, race)")
+    port = free_port()
+    srv = Server(data_dir, port)
+    srv.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        exp = time.time() + 300
+
+        # -- field conflicts must not disturb the live choice -----------
+        status, body = http("POST", f"{base}/v1/withdrawals",
+                            {"device_id": "DEV-W0", "op_id": "OP-W0",
+                             "summary": "CMD:arm"})
+        report("withdraw without any choice -> 404 WITHDRAW_NO_CHOICE",
+               status == 404 and body["verdict"] == "WITHDRAW_NO_CHOICE",
+               f"{status} {body}")
+
+        http("POST", f"{base}/v1/choices",
+             {"device_id": "DEV-W1", "op_id": "OP-W1",
+              "summary": "CMD:arm", "expires_at": exp})
+        status, body = http("POST", f"{base}/v1/withdrawals",
+                            {"device_id": "DEV-W1", "op_id": "OP-OTHER",
+                             "summary": "CMD:arm"})
+        report("withdraw for another op id -> 409 WITHDRAW_WRONG_OP",
+               status == 409 and body["verdict"] == "WITHDRAW_WRONG_OP",
+               f"{status} {body}")
+        status, body = http("POST", f"{base}/v1/withdrawals",
+                            {"device_id": "DEV-W1", "op_id": "OP-W1",
+                             "summary": "CMD:disarm"})
+        report("withdraw with wrong summary -> 409 "
+               "WITHDRAW_SUMMARY_MISMATCH",
+               status == 409
+               and body["verdict"] == "WITHDRAW_SUMMARY_MISMATCH",
+               f"{status} {body}")
+
+        # -- withdraw + immutable replay --------------------------------
+        status, body = http("POST", f"{base}/v1/withdrawals",
+                            {"device_id": "DEV-W1", "op_id": "OP-W1",
+                             "summary": "CMD:arm"})
+        withdrawn_at = body.get("result", {}).get("withdrawn_at")
+        report("withdraw live choice -> WITHDRAWN",
+               status == 200 and body["verdict"] == "WITHDRAWN"
+               and withdrawn_at is not None,
+               f"{status} {body}")
+
+        status, body = http("POST", f"{base}/v1/withdrawals",
+                            {"device_id": "DEV-W1", "op_id": "OP-W1",
+                             "summary": "CMD:arm"})
+        report("identical withdraw retx replays the immutable verdict",
+               status == 200 and body["verdict"] == "WITHDRAW_REPLAYED"
+               and body["result"]["withdrawn_at"] == withdrawn_at,
+               f"{status} {body}")
+
+        status, body = http("POST", f"{base}/v1/executions",
+                            {"device_id": "DEV-W1", "op_id": "OP-W1",
+                             "summary": "CMD:arm"})
+        report("withdrawn choice cannot execute -> 410 EXEC_WITHDRAWN",
+               status == 410 and body["verdict"] == "EXEC_WITHDRAWN",
+               f"{status} {body}")
+
+        status, body = http("POST", f"{base}/v1/choices",
+                            {"device_id": "DEV-W1", "op_id": "OP-W1",
+                             "summary": "CMD:arm", "expires_at": exp})
+        report("withdrawn op id cannot be re-selected "
+               "-> 409 CHOICE_WITHDRAWN",
+               status == 409 and body["verdict"] == "CHOICE_WITHDRAWN",
+               f"{status} {body}")
+
+        # -- re-select under a NEW op id after withdrawal ---------------
+        status, body = http("POST", f"{base}/v1/choices",
+                            {"device_id": "DEV-W1", "op_id": "OP-W1B",
+                             "summary": "CMD:arm", "expires_at": exp})
+        report("device may be re-selected with a new op id",
+               status == 201 and body["verdict"] == "CHOICE_CREATED",
+               f"{status} {body}")
+        status, body = http("POST", f"{base}/v1/executions",
+                            {"device_id": "DEV-W1", "op_id": "OP-W1B",
+                             "summary": "CMD:arm"})
+        report("re-selected choice executes via the normal flow",
+               status == 200 and body["verdict"] == "EXEC_ACCEPTED",
+               f"{status} {body}")
+
+        # -- withdraw after execution returns the executed result -------
+        http("POST", f"{base}/v1/choices",
+             {"device_id": "DEV-W2", "op_id": "OP-W2",
+              "summary": "CMD:arm", "expires_at": exp})
+        _, exec_body = http("POST", f"{base}/v1/executions",
+                            {"device_id": "DEV-W2", "op_id": "OP-W2",
+                             "summary": "CMD:arm"})
+        receipt = exec_body["result"]["outcome"]["receipt"]
+        status, body = http("POST", f"{base}/v1/withdrawals",
+                            {"device_id": "DEV-W2", "op_id": "OP-W2",
+                             "summary": "CMD:arm"})
+        report("withdraw after execution returns the executed result",
+               status == 409
+               and body["verdict"] == "WITHDRAW_ALREADY_EXECUTED"
+               and body["result"]["outcome"]["receipt"] == receipt,
+               f"{status} {body}")
+
+        # -- withdraw vs execute race: single terminal state ------------
+        n_rounds = 6
+        exec_wins = 0
+        race_ok = True
+        details = []
+        for i in range(n_rounds):
+            dev, op = f"DEV-R{i}", f"OP-R{i}"
+            http("POST", f"{base}/v1/choices",
+                 {"device_id": dev, "op_id": op, "summary": "CMD:arm",
+                  "expires_at": exp})
+            reqs = ["/v1/withdrawals", "/v1/executions"]
+            if i % 2:
+                reqs.reverse()  # alternate which request is fired first
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futs = {path: pool.submit(
+                            http, "POST", f"{base}{path}",
+                            {"device_id": dev, "op_id": op,
+                             "summary": "CMD:arm"}, 30)
+                        for path in reqs}
+                ws, wb = futs["/v1/withdrawals"].result()
+                es, eb = futs["/v1/executions"].result()
+            wv, ev = wb.get("verdict"), eb.get("verdict")
+            details.append(f"round{i}: W={wv} E={ev}")
+            if wv == "WITHDRAWN" and ev == "EXEC_WITHDRAWN":
+                pass  # withdrawal committed first, payload untouched
+            elif (wv == "WITHDRAW_ALREADY_EXECUTED"
+                  and ev == "EXEC_ACCEPTED"
+                  and wb["result"]["outcome"]["receipt"]
+                  == eb["result"]["outcome"]["receipt"]):
+                exec_wins += 1  # execution completed first, same result
+            else:
+                race_ok = False
+        print("    " + "; ".join(details))
+        report("withdraw/execute race settles to a single terminal state",
+               race_ok, "; ".join(details))
+        report("withdraw-first rounds never touched the payload",
+               srv.gateway_dispatches() == 2 + exec_wins,
+               f"dispatches={srv.gateway_dispatches()} "
+               f"(OP-W1B + OP-W2 + {exec_wins} race wins)")
+    finally:
+        srv.stop()
+
+
+def smoke_withdrawal_restart(data_dir: str) -> None:
+    section("PHASE 3h: withdrawal final state replays across restart")
+    port = free_port()
+    srv = Server(data_dir, port)
+    srv.start()
+    base = f"http://127.0.0.1:{port}"
+    exp = time.time() + 300
+    http("POST", f"{base}/v1/choices",
+         {"device_id": "DEV-WR", "op_id": "OP-WR",
+          "summary": "CMD:arm", "expires_at": exp})
+    status, body = http("POST", f"{base}/v1/withdrawals",
+                        {"device_id": "DEV-WR", "op_id": "OP-WR",
+                         "summary": "CMD:arm"})
+    withdrawn_at = body.get("result", {}).get("withdrawn_at")
+    report("withdraw committed before restart",
+           status == 200 and body["verdict"] == "WITHDRAWN",
+           f"{status} {body}")
+    srv.stop()
+
+    # ---- restart a new process over the same durable directory ----
+    srv2 = Server(data_dir, port)
+    srv2.start()
+    try:
+        status, body = http("GET", f"{base}/v1/devices/DEV-WR")
+        report("recovered to WITHDRAWN after restart",
+               status == 200 and body["result"]["state"] == "WITHDRAWN",
+               f"{status} {body}")
+
+        status, body = http("POST", f"{base}/v1/withdrawals",
+                            {"device_id": "DEV-WR", "op_id": "OP-WR",
+                             "summary": "CMD:arm"})
+        report("withdraw retx after restart replays the same verdict",
+               status == 200 and body["verdict"] == "WITHDRAW_REPLAYED"
+               and body["result"]["withdrawn_at"] == withdrawn_at,
+               f"{status} {body}")
+
+        status, body = http("POST", f"{base}/v1/executions",
+                            {"device_id": "DEV-WR", "op_id": "OP-WR",
+                             "summary": "CMD:arm"})
+        report("withdrawn choice not executable after restart",
+               status == 410 and body["verdict"] == "EXEC_WITHDRAWN",
+               f"{status} {body}")
+
+        status, body = http("POST", f"{base}/v1/choices",
+                            {"device_id": "DEV-WR", "op_id": "OP-WR2",
+                             "summary": "CMD:arm", "expires_at": exp})
+        report("new op id may be selected after restart",
+               status == 201 and body["verdict"] == "CHOICE_CREATED",
+               f"{status} {body}")
+        status, body = http("POST", f"{base}/v1/executions",
+                            {"device_id": "DEV-WR", "op_id": "OP-WR2",
+                             "summary": "CMD:arm"})
+        report("new choice executes after restart",
+               status == 200 and body["verdict"] == "EXEC_ACCEPTED",
+               f"{status} {body}")
+        report("exactly one physical dispatch (the new op only)",
+               srv2.gateway_dispatches() == 1,
+               f"{srv2.gateway_dispatches()}")
+    finally:
+        srv2.stop()
+
+
 def _crash_execute(data_dir: str, device: str, op: str, when: str):
     """Start server, crash it at the requested point, return receipt seen."""
     port = free_port()
@@ -475,7 +683,7 @@ def smoke_corruption(data_dir: str) -> None:
 
 
 def phase_http() -> list[str]:
-    dirs = [fresh_dir() for _ in range(6)]
+    dirs = [fresh_dir() for _ in range(8)]
     try:
         # 3a: basic flow
         port = free_port()
@@ -488,9 +696,11 @@ def phase_http() -> list[str]:
 
         smoke_concurrency(dirs[1])
         smoke_expiry(dirs[2])
-        smoke_crash_before_result(dirs[3])
-        smoke_crash_after_result(dirs[4])
-        smoke_corruption(dirs[4])  # corrupt the durable executed record
+        smoke_withdrawal(dirs[3])
+        smoke_withdrawal_restart(dirs[4])
+        smoke_crash_before_result(dirs[5])
+        smoke_crash_after_result(dirs[6])
+        smoke_corruption(dirs[6])  # corrupt the durable executed record
         return dirs
     finally:
         pass  # cleaned by caller
@@ -523,6 +733,33 @@ def phase_remote(base_url: str) -> None:
                          "summary": "CMD:arm"})
     report("remote execute retx replays",
            status == 200 and body["result"]["outcome"]["receipt"] == receipt,
+           f"{status} {body}")
+
+    # withdrawal flow on a second fresh remote device
+    token_w = f"RW-{int(time.time()*1000)}"
+    status, body = http("POST", f"{base_url}/v1/choices",
+                        {"device_id": f"DEV-{token_w}",
+                         "op_id": f"OP-{token_w}",
+                         "summary": "CMD:arm", "expires_at": exp})
+    report("remote create choice (withdrawal)", status == 201,
+           f"{status} {body}")
+    status, body = http("POST", f"{base_url}/v1/withdrawals",
+                        {"device_id": f"DEV-{token_w}",
+                         "op_id": f"OP-{token_w}", "summary": "CMD:arm"})
+    report("remote withdraw commits",
+           status == 200 and body["verdict"] == "WITHDRAWN",
+           f"{status} {body}")
+    status, body = http("POST", f"{base_url}/v1/withdrawals",
+                        {"device_id": f"DEV-{token_w}",
+                         "op_id": f"OP-{token_w}", "summary": "CMD:arm"})
+    report("remote withdraw retx replays the verdict",
+           status == 200 and body["verdict"] == "WITHDRAW_REPLAYED",
+           f"{status} {body}")
+    status, body = http("POST", f"{base_url}/v1/executions",
+                        {"device_id": f"DEV-{token_w}",
+                         "op_id": f"OP-{token_w}", "summary": "CMD:arm"})
+    report("remote withdrawn choice cannot execute",
+           status == 410 and body["verdict"] == "EXEC_WITHDRAWN",
            f"{status} {body}")
 
 

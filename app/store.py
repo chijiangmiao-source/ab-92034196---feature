@@ -11,13 +11,20 @@ Recovery rules (crash may happen at *any* point, incl. mid-fsync):
 * ``executing`` record intact, no result        -> ``SELECTED`` (safe retry)
 * An intact ``executing`` *and* an intact
   ``result`` record                              -> ``EXECUTED`` (replayable)
+* An intact ``withdrawn`` record (no result)    -> ``WITHDRAWN`` (terminal;
+                                                   the immutable withdrawal
+                                                   verdict replays and the
+                                                   choice can never execute)
 * A corrupt / unverifiable record               -> health UNHEALTHY;
                                                    the device's choice is
                                                    quarantined and refuses
                                                    further commands
 
 Old choices never revive: replacing a choice writes a new index entry that
-points at a new operation file; stale files are simply not referenced.
+points at a new operation file; stale files are simply not referenced.  A
+withdrawn choice never revives either: the ``withdrawn`` record lives in
+the same operation file the index still points at, and the service refuses
+to re-select the withdrawn operation id.
 """
 
 from __future__ import annotations
@@ -33,10 +40,12 @@ from typing import Optional
 RECORD_SELECTED = "selected"
 RECORD_EXECUTING = "executing"
 RECORD_RESULT = "result"
+RECORD_WITHDRAWN = "withdrawn"
 
 STATE_MISSING = "MISSING"
 STATE_SELECTED = "SELECTED"
 STATE_EXECUTED = "EXECUTED"
+STATE_WITHDRAWN = "WITHDRAWN"
 
 MAGIC = "GS-CHOICE-1"
 
@@ -81,6 +90,7 @@ class _IndexEntry:
     state: str = STATE_MISSING
     record: Optional[dict] = None
     result: Optional[dict] = None
+    withdrawal: Optional[dict] = None
     corrupt: bool = False
 
 
@@ -176,16 +186,21 @@ class RecordStore:
         latest_selected = None
         executing = False
         result = None
+        withdrawn = None
         for rec in records:
             kind = rec.get("kind")
             if kind == RECORD_SELECTED and rec.get("op_id") == op_id:
                 latest_selected = rec
                 executing = False
                 result = None
+                withdrawn = None
             elif kind == RECORD_EXECUTING and rec.get("op_id") == op_id:
                 executing = True
             elif kind == RECORD_RESULT and rec.get("op_id") == op_id:
                 result = rec
+                executing = False
+            elif kind == RECORD_WITHDRAWN and rec.get("op_id") == op_id:
+                withdrawn = rec
                 executing = False
 
         if latest_selected is None:
@@ -197,6 +212,11 @@ class RecordStore:
         if result is not None:
             entry.state = STATE_EXECUTED
             entry.result = result
+        elif withdrawn is not None:
+            # Withdrawal is terminal: the choice can never execute and the
+            # immutable verdict stays replayable across restarts.
+            entry.state = STATE_WITHDRAWN
+            entry.withdrawal = withdrawn
         elif executing:
             # Crash between "executing" and "result" fsync: the downstream
             # command may or may not have happened.  We cannot prove
@@ -301,6 +321,21 @@ class RecordStore:
             self.append(entry.op_id, result)
             entry.state = STATE_EXECUTED
             entry.result = result
+
+    def put_withdrawal(self, device_id: str, record: dict) -> None:
+        """Persist the immutable withdrawal verdict for the current choice.
+
+        The record is appended to the same operation log the device index
+        already points at, so no index rewrite is needed; recovery finds
+        it there and restores the terminal WITHDRAWN state.
+        """
+        with self._lock:
+            entry = self._devices.get(device_id)
+            if entry is None or entry.record is None:
+                return
+            self.append(entry.op_id, record)
+            entry.state = STATE_WITHDRAWN
+            entry.withdrawal = record
 
     def get(self, device_id: str) -> Optional[_IndexEntry]:
         with self._lock:

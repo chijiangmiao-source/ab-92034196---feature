@@ -1,4 +1,4 @@
-"""Selection / execution adjudication service.
+"""Selection / execution / withdrawal adjudication service.
 
 Protocol (high-risk telecommands require *select-before-execute*):
 
@@ -17,6 +17,20 @@ Protocol (high-risk telecommands require *select-before-execute*):
    state, never a second physical dispatch).
 6. Choices under a different operation id are rejected; expired choices
    must not execute.
+7. While a choice is still valid and unexecuted, the duty officer may
+   **withdraw** it (device id + original operation id + command summary).
+   The withdrawal verdict is persisted before it is answered and is
+   immutable: identical retransmissions replay it, a mismatched summary
+   or an operation id that does not own the live choice is an explicit
+   conflict, and the withdrawn choice can never execute -- not now, and
+   not after a restart.  The withdrawn operation id stays closed, but
+   the device may immediately be selected again under a *new* operation
+   id, following the ordinary select-execute flow.
+8. A withdrawal and an execution arriving together are serialised by the
+   per-device lock into a single terminal state: if the withdrawal
+   commits first the execution never reaches the payload
+   (``EXEC_WITHDRAWN``); if the execution completes first the withdrawal
+   returns the executed result (``WITHDRAW_ALREADY_EXECUTED``).
 """
 
 from __future__ import annotations
@@ -32,8 +46,10 @@ from .store import (
     RecordStore,
     STATE_EXECUTED,
     STATE_SELECTED,
+    STATE_WITHDRAWN,
     RECORD_RESULT,
     RECORD_SELECTED,
+    RECORD_WITHDRAWN,
 )
 
 # Verdicts
@@ -44,6 +60,7 @@ V_CHOICE_DEVICE_BUSY = "CHOICE_DEVICE_BUSY"    # other live choice exists
 V_CHOICE_DEVICE_EXECUTED = "CHOICE_DEVICE_EXECUTED"  # already executed
 V_CHOICE_EXPIRED_REQUEST = "CHOICE_EXPIRED_REQUEST"  # expires_at in past
 V_CHOICE_BAD_REQUEST = "CHOICE_BAD_REQUEST"
+V_CHOICE_WITHDRAWN = "CHOICE_WITHDRAWN"        # op id was withdrawn
 
 V_EXEC_ACCEPTED = "EXEC_ACCEPTED"
 V_EXEC_REPLAYED = "EXEC_REPLAYED"              # retx after completion
@@ -52,9 +69,18 @@ V_EXEC_WRONG_OP = "EXEC_WRONG_OP"              # different op id requested
 V_EXEC_SUMMARY_MISMATCH = "EXEC_SUMMARY_MISMATCH"
 V_EXEC_EXPIRED = "EXEC_EXPIRED"
 V_EXEC_QUARANTINED = "EXEC_QUARANTINED"        # corrupt durable state
+V_EXEC_WITHDRAWN = "EXEC_WITHDRAWN"            # choice was withdrawn
+
+V_WITHDRAWN = "WITHDRAWN"                      # withdrawal committed
+V_WITHDRAW_REPLAYED = "WITHDRAW_REPLAYED"      # identical retx replay
+V_WITHDRAW_NO_CHOICE = "WITHDRAW_NO_CHOICE"
+V_WITHDRAW_WRONG_OP = "WITHDRAW_WRONG_OP"      # choice owned by other op
+V_WITHDRAW_SUMMARY_MISMATCH = "WITHDRAW_SUMMARY_MISMATCH"
+V_WITHDRAW_ALREADY_EXECUTED = "WITHDRAW_ALREADY_EXECUTED"
 
 SUCCESS_VERDICTS = {V_CHOICE_CREATED, V_CHOICE_REPLAYED,
-                    V_EXEC_ACCEPTED, V_EXEC_REPLAYED}
+                    V_EXEC_ACCEPTED, V_EXEC_REPLAYED,
+                    V_WITHDRAWN, V_WITHDRAW_REPLAYED}
 
 
 @dataclass
@@ -116,8 +142,20 @@ class DutyService:
                 return Response(V_EXEC_QUARANTINED, 503,
                                 detail="durable record unverifiable")
 
-            # Retransmission / duplicate of the same operation id.
-            if entry is not None and entry.op_id == op_id and entry.record:
+            if entry is not None and entry.state == STATE_WITHDRAWN:
+                if entry.op_id == op_id:
+                    # The withdrawn operation id stays closed forever:
+                    # re-selecting it would resurrect a choice that must
+                    # never execute.
+                    return Response(
+                        V_CHOICE_WITHDRAWN, 409,
+                        detail=(f"op_id={op_id} was withdrawn at "
+                                f"{(entry.withdrawal or {}).get('withdrawn_at')}"
+                                "; it cannot be selected again"))
+                # Withdrawn choice is dead: a *different* op id replaces
+                # it and follows the ordinary select-execute flow.
+            elif entry is not None and entry.op_id == op_id and entry.record:
+                # Retransmission / duplicate of the same operation id.
                 rec = entry.record
                 if (rec.get("summary") == summary
                         and float(rec.get("expires_at")) == expires_at):
@@ -138,7 +176,7 @@ class DutyService:
                             f"expires_at={expires_at}"))
 
             # A different op id for the same device.
-            if entry is not None:
+            elif entry is not None:
                 if entry.state == STATE_EXECUTED:
                     return Response(V_CHOICE_DEVICE_EXECUTED, 409,
                                     detail="device already executed; "
@@ -201,6 +239,12 @@ class DutyService:
             if rec.get("summary") != summary:
                 return Response(V_EXEC_SUMMARY_MISMATCH, 409,
                                 detail="summary does not match the choice")
+            if entry.state == STATE_WITHDRAWN:
+                # Withdrawn choice: terminally dead, never dispatch.
+                return Response(V_EXEC_WITHDRAWN, 410,
+                                result=self._public_withdrawal(
+                                    entry.withdrawal),
+                                detail="choice was withdrawn")
             if float(rec.get("expires_at")) <= self._clock():
                 return Response(V_EXEC_EXPIRED, 410,
                                 detail="choice expired")
@@ -235,6 +279,64 @@ class DutyService:
                             result=self._public_result(result))
 
     # ------------------------------------------------------------------ #
+    # withdraw
+    # ------------------------------------------------------------------ #
+    def withdraw(self, device_id: str, op_id: str, summary: str) -> Response:
+        """Withdraw a still-valid, unexecuted choice.
+
+        The verdict is persisted *before* it is answered, so any verdict
+        the caller observes is durable and replays identically (same
+        ``withdrawn_at``) across retransmissions and restarts.
+        """
+        err = self._validate(device_id, op_id, summary, None)
+        if err:
+            return err
+
+        with self._device_lock(device_id):
+            entry = self.store.get(device_id)
+
+            if entry is None or entry.record is None:
+                return Response(V_WITHDRAW_NO_CHOICE, 404,
+                                detail="no choice for device")
+            if entry.corrupt:
+                return Response(V_EXEC_QUARANTINED, 503,
+                                detail="durable record unverifiable")
+            if entry.op_id != op_id:
+                return Response(V_WITHDRAW_WRONG_OP, 409,
+                                detail=f"live choice belongs to "
+                                       f"op_id={entry.op_id}")
+            rec = entry.record
+            if rec.get("summary") != summary:
+                return Response(V_WITHDRAW_SUMMARY_MISMATCH, 409,
+                                detail="summary does not match the choice")
+
+            if entry.state == STATE_EXECUTED and entry.result is not None:
+                # The execution committed first: the withdrawal cannot
+                # apply.  Answer with the final executed result -- never
+                # a "processing" state.
+                return Response(V_WITHDRAW_ALREADY_EXECUTED, 409,
+                                result=self._public_result(entry.result),
+                                detail="choice already executed")
+
+            if entry.state == STATE_WITHDRAWN:
+                # Identical retransmission: replay the immutable verdict.
+                return Response(V_WITHDRAW_REPLAYED, 200,
+                                result=self._public_withdrawal(
+                                    entry.withdrawal))
+
+            # --- first withdrawal: persist the immutable verdict ---
+            record = {
+                "kind": RECORD_WITHDRAWN,
+                "device_id": device_id,
+                "op_id": op_id,
+                "summary": summary,
+                "withdrawn_at": self._clock(),
+            }
+            self.store.put_withdrawal(device_id, record)
+            return Response(V_WITHDRAWN, 200,
+                            result=self._public_withdrawal(record))
+
+    # ------------------------------------------------------------------ #
     # health / introspection
     # ------------------------------------------------------------------ #
     def health(self) -> Response:
@@ -259,6 +361,8 @@ class DutyService:
         }
         if entry.state == STATE_EXECUTED:
             body["result"] = self._public_result(entry.result)
+        elif entry.state == STATE_WITHDRAWN:
+            body["withdrawal"] = self._public_withdrawal(entry.withdrawal)
         return Response("DEVICE_STATE", 200, result=body)
 
     # ------------------------------------------------------------------ #
@@ -297,6 +401,18 @@ class DutyService:
             "state": STATE_EXECUTED,
             "outcome": rec.get("outcome"),
             "finished_at": rec.get("finished_at"),
+        }
+
+    @staticmethod
+    def _public_withdrawal(rec: Optional[dict]) -> Optional[dict]:
+        if rec is None:
+            return None
+        return {
+            "device_id": rec["device_id"],
+            "op_id": rec["op_id"],
+            "summary": rec["summary"],
+            "state": STATE_WITHDRAWN,
+            "withdrawn_at": rec.get("withdrawn_at"),
         }
 
     @staticmethod

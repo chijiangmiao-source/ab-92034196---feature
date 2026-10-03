@@ -16,6 +16,14 @@
 | 执行请求摘要与选择不一致 | `EXEC_SUMMARY_MISMATCH` (409) |
 | 选择已过期仍要求执行 | `EXEC_EXPIRED` (410)，绝不下发 |
 | 两个并发执行请求竞争同一有效选择 | 恰一个 `EXEC_ACCEPTED`，其余阻塞后收到**同一最终结果** `EXEC_REPLAYED`，物理下行仅一次 |
+| 撤回仍有效且未执行的选择（设备标识 + 原操作标识 + 命令摘要） | `WITHDRAWN` (200)，撤回裁决先持久化后应答，**不可变** |
+| 相同撤回请求重传 | 回放原撤回裁决：`WITHDRAW_REPLAYED` (200)，`withdrawn_at` 逐字节一致 |
+| 撤回摘要与选择不符 / 选择不属于该操作标识 | `WITHDRAW_SUMMARY_MISMATCH` / `WITHDRAW_WRONG_OP` (409)，明确冲突且不扰动原选择 |
+| 执行已完成后撤回 | `WITHDRAW_ALREADY_EXECUTED` (409)，返回已执行结果，不留处理中状态 |
+| 执行已撤回的选择 | `EXEC_WITHDRAWN` (410)，绝不触达载荷，重启后亦不复活 |
+| 重新选择已撤回的操作标识 | `CHOICE_WITHDRAWN` (409)，该操作标识永久关闭 |
+| 撤回后以**新**操作标识重新选择 | `CHOICE_CREATED` (201)，沿用既有选择—执行流程 |
+| 撤回与执行同时到达 | 每设备锁串行化为**单一终态**：撤回先成立则执行 `EXEC_WITHDRAWN` 且载荷零触达；执行先完成则撤回得 `WITHDRAW_ALREADY_EXECUTED` |
 | 持久记录无法通过校验 | 健康检查 503，设备被隔离（`EXEC_QUARANTINED`） |
 
 ## 断电恢复
@@ -26,7 +34,10 @@
 - **结果落盘前**中断（已写 executing 标记、下游幂等已送达）：重启恢复为
   `SELECTED`（可安全重试）；重试经下游幂等去重，物理命令仍只下发一次。
 - **结果落盘后**中断：重启直接恢复为 `EXECUTED`，重放完全相同的结果回执。
-- 旧选择的记录文件不再被索引引用，**不会复活**。
+- **撤回记录落盘后**中断：重启恢复为终态 `WITHDRAWN`，重放同一撤回裁决
+  （`withdrawn_at` 不变），原选择永远不会重新变为可执行。
+- 旧选择的记录文件不再被索引引用，**不会复活**；已撤回的操作标识同样
+  **不会复活**（重新选择该标识一律 `CHOICE_WITHDRAWN`）。
 - 撕裂写入/校验和不符的记录在恢复时被检出，`/healthz` 返回 `unhealthy`。
 
 ## HTTP API
@@ -34,6 +45,7 @@
 ```
 POST /v1/choices       {"device_id","op_id","summary","expires_at"}
 POST /v1/executions    {"device_id","op_id","summary"}
+POST /v1/withdrawals   {"device_id","op_id","summary"}
 GET  /v1/devices/<id>
 GET  /healthz
 ```
@@ -59,16 +71,19 @@ docker compose up --build verify
 
 `verify` 为**可执行一次性**服务（`rest: "no"`），顺序完成并以退出码报告：
 
-1. 代码测试（unittest：裁决、并发竞争、断电恢复、校验和完整性）
+1. 代码测试（unittest：裁决、撤回、并发竞争、断电恢复、校验和完整性）
 2. 构建检查（compileall）
 3. 容器内 HTTP/API 冒烟，实际覆盖：
    - 健康检查与选择—执行全流程（重传回放、字段冲突、他操作标识拒绝）
    - **并发**：6 个并发执行请求竞争同一有效选择，仅一个首次消费成功
    - **过期**：选择过期后执行被拒，新操作标识可替换且旧选择失效
+   - **撤回**：不可变撤回裁决与重传回放、摘要/操作标识冲突、撤回后
+     以新操作标识重新选择并执行、撤回与执行并发竞争（单一终态，
+     撤回先成立则载荷零触达）、重启后撤回终态回放且原选择不可执行
    - **断电恢复 ×2**：结果落盘前/后分别注入硬中断，重启新进程后验证
      安全重试 / 结果重放，且物理下行跨重启仅一次
    - 持久记录损坏 → `/healthz` 503
-4. 经 compose 网络对常驻 `duty` 服务做健康与选择—执行冒烟（`BASE_URL`）
+4. 经 compose 网络对常驻 `duty` 服务做健康与选择—执行—撤回冒烟（`BASE_URL`）
 
 成功时末行打印 `ALL ACCEPTANCE CHECKS PASSED` 并以 `0` 退出；
 任何检查失败则以非零退出码报告。
